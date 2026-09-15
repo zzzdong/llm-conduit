@@ -1,0 +1,64 @@
+[package]
+name = "llm-conduit"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight, single-binary OpenAI-compatible AI model gateway: model-based upstream routing, unified-key mapping and streaming"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/zzzdong/llm-conduit"
+keywords = ["openai", "gateway", "llm", "proxy", "vllm"]
+categories = [
+    "command-line-utilities",
+    "network-programming",
+    "web-programming::http-server",
+]
+exclude = [".github/"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+
+# HTTP server + client
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "client",
+    "client-legacy",
+    "http1",
+    "server",
+    "server-graceful",
+    "tokio",
+] }
+http-body-util = "0.1"
+bytes = "1"
+
+# Configuration and JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1.6"
+
+# Command line parsing (--help / --version / usage errors)
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+
+# TLS: the ring provider, which avoids aws-lc-rs' C toolchain dependency and keeps
+# musl cross-compilation simple
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "tls12",
+    "logging",
+    "native-tokio",
+    "webpki-tokio",
+] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

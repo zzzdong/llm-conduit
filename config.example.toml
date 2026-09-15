@@ -1,0 +1,39 @@
+# llm-conduit example configuration
+# Usage: llm-conduit config.toml   (or: llm-conduit -c /etc/llm-conduit/config.toml)
+
+[server]
+listen = "0.0.0.0:4000"
+# Fallback upstream used when no model is given (neither X-Model nor body.model)
+default_upstream = "llama-3.1-8b-instruct"
+# Request body limit; anything larger gets a 413. Default: 200000000 (200 MB)
+max_body_bytes = 200000000
+
+# Optional: configuring this section enables server-side HTTPS; leave it out for plain HTTP
+# [server.tls]
+# cert_path = "/etc/llm-conduit/fullchain.pem"
+# key_path  = "/etc/llm-conduit/privkey.pem"
+
+# Optional: caller authentication with unified keys
+[auth]
+enabled = true
+# unified key = "caller description" (the description is written to the audit log)
+keys = { "sk-gateway-0001" = "frontend", "sk-gateway-0002" = "backend" }
+
+# Upstreams: the routing name (= the model clients request) maps to one backend instance.
+# Note: a dot is TOML's level separator, so a name containing one must be quoted, i.e.
+#       [upstreams."llama-3.1-8b-instruct"]; otherwise it becomes a sub-table of upstreams.llama-3 and startup fails.
+[upstreams."llama-3.1-8b-instruct"]
+base_url = "http://127.0.0.1:8000"
+# Bearer token injected when forwarding (callers never see it)
+api_key = "upstream-key-0001"
+# Only needed when the upstream's served_model_name differs from the routing name, e.g. when vLLM
+# runs with --served-model-name meta-llama/Llama-3.1-8B-Instruct:
+# upstream_model = "meta-llama/Llama-3.1-8B-Instruct"
+# Enabling it triggers JSON parsing + re-serialization (long conversations amplify memory)
+
+[upstreams.mistral-7b-instruct]
+base_url = "http://127.0.0.1:8001"
+api_key = "upstream-key-0002"
+
+# Upstream HTTPS with a self-signed certificate (test environments only)
+# insecure_skip_verify = true
