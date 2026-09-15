@@ -97,15 +97,32 @@ jobs:
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release/llm-conduit"
           file "$BIN"
-          # A musl build has to be static to stay dependency-free. Depending on the
-          # toolchain `file` reports either "static-pie linked" or "statically linked".
-          file "$BIN" | grep -Eq 'static(-pie)? linked'
-          # No shared library dependencies at all.
-          if readelf -d "$BIN" | grep -q NEEDED; then
-            echo "unexpected dynamic dependencies:" >&2
-            readelf -d "$BIN" | grep NEEDED >&2
+
+          # A musl build has to be static to stay dependency-free, but the wording of
+          # `file` varies between binutils versions ("statically linked", "static-pie
+          # linked", ...), so assert on the ELF itself instead:
+          #   no PT_INTERP -> the binary cannot be started through a dynamic loader
+          #   no DT_NEEDED -> it does not depend on any shared library
+          command -v readelf >/dev/null ||
+            { echo "binutils (readelf) is required for this check"; exit 1; }
+
+          segments=$(readelf -l "$BIN") ||
+            { echo "error: readelf failed on $BIN"; exit 1; }
+          if grep -q INTERP <<<"$segments"; then
+            echo "error: $BIN has a program interpreter, so it is not statically linked"
             exit 1
           fi
+
+          # A static-pie binary does have a .dynamic section, so `readelf -d` failing
+          # (no dynamic section at all) is fine; what must not happen is a NEEDED entry.
+          dynamic=$(readelf -d "$BIN" 2>/dev/null || true)
+          if grep -q NEEDED <<<"$dynamic"; then
+            echo "error: $BIN depends on shared libraries:"
+            grep NEEDED <<<"$dynamic"
+            exit 1
+          fi
+
+          echo "$BIN is static with no dynamic dependencies"
 
       - name: Smoke test (native arch only)
         if: matrix.target == 'x86_64-unknown-linux-musl'
