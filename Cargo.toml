@@ -1,6 +1,6 @@
 [package]
 name = "llm-conduit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight, single-binary OpenAI-compatible AI model gateway: model-based upstream routing, unified-key mapping and streaming"
 license = "MIT"

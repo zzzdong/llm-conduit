@@ -40,8 +40,8 @@ cargo build --release --target x86_64-unknown-linux-musl     # static musl, see 
 The tarballs contain the binary plus `config.example.toml`:
 
 ```bash
-tar -xzf llm-conduit-0.1.0-aarch64-unknown-linux-musl.tar.gz
-cd llm-conduit-0.1.0-aarch64-unknown-linux-musl
+tar -xzf llm-conduit-0.2.0-aarch64-unknown-linux-musl.tar.gz
+cd llm-conduit-0.2.0-aarch64-unknown-linux-musl
 ```
 
 **2. Write a config.** A minimal `config.toml`:
