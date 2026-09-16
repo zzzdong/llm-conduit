@@ -38,6 +38,71 @@ pub struct ServerConfig {
     /// Configuring this section enables server-side HTTPS.
     #[serde(default)]
     pub tls: Option<TlsServerConfig>,
+    /// Upstream probing behind `GET /readyz`.
+    #[serde(default)]
+    pub health: HealthConfig,
+}
+
+/// Upstream health probing, surfaced through `GET /readyz`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Probe upstreams in the background; when disabled `/readyz` is always ready.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Seconds between two probe passes.
+    #[serde(default = "default_health_interval_secs")]
+    pub interval_secs: u64,
+    /// Timeout of a single probe, in seconds.
+    #[serde(default = "default_health_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Probe kind: `models` requires a successful `GET /v1/models`, `tcp` only opens a connection.
+    #[serde(default)]
+    pub mode: HealthMode,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_health_interval_secs(),
+            timeout_secs: default_health_timeout_secs(),
+            mode: HealthMode::default(),
+        }
+    }
+}
+
+/// How an upstream is probed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthMode {
+    /// `GET /v1/models` has to answer with a success status.
+    #[default]
+    Models,
+    /// A plain TCP connection is enough; only reachability is checked.
+    Tcp,
+}
+
+impl HealthMode {
+    /// Stable name, used in logs and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Models => "models",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_health_interval_secs() -> u64 {
+    10
+}
+
+fn default_health_timeout_secs() -> u64 {
+    2
 }
 
 fn default_max_body_bytes() -> u64 {
@@ -124,6 +189,11 @@ impl Upstream {
             .build()
             .map_err(|e| GatewayError::internal(format!("failed to build upstream URL: {e}")))
     }
+
+    /// Whether this upstream is reached over TLS.
+    pub fn uses_tls(&self) -> bool {
+        self.base.scheme_str() == Some("https")
+    }
 }
 
 impl Config {
@@ -165,6 +235,18 @@ impl Config {
         if self.server.max_body_bytes == 0 {
             return Err(StartupError(
                 "server.max_body_bytes must be greater than 0".into(),
+            ));
+        }
+
+        if self.server.health.enabled && self.server.health.interval_secs == 0 {
+            return Err(StartupError(
+                "server.health.interval_secs must be greater than 0".into(),
+            ));
+        }
+
+        if self.server.health.enabled && self.server.health.timeout_secs == 0 {
+            return Err(StartupError(
+                "server.health.timeout_secs must be greater than 0".into(),
             ));
         }
 
@@ -405,5 +487,61 @@ base_url = "http://127.0.0.1:8000/vllm/"
             target.to_string(),
             "http://127.0.0.1:8000/vllm/v1/chat/completions?x=1"
         );
+    }
+
+    #[test]
+    fn health_defaults_are_enabled_models_with_ten_second_interval() {
+        let text = r#"
+[server]
+listen = "0.0.0.0:4000"
+[upstreams.a]
+base_url = "http://127.0.0.1:8000"
+"#;
+        let cfg = Config::parse(text).unwrap();
+        assert!(cfg.server.health.enabled);
+        assert_eq!(cfg.server.health.interval_secs, 10);
+        assert_eq!(cfg.server.health.timeout_secs, 2);
+        assert_eq!(cfg.server.health.mode, HealthMode::Models);
+    }
+
+    #[test]
+    fn health_section_is_configurable() {
+        let text = r#"
+[server]
+listen = "0.0.0.0:4000"
+[server.health]
+enabled = false
+interval_secs = 30
+timeout_secs = 5
+mode = "tcp"
+[upstreams.a]
+base_url = "https://127.0.0.1:8000"
+"#;
+        let cfg = Config::parse(text).unwrap();
+        assert!(!cfg.server.health.enabled);
+        assert_eq!(cfg.server.health.interval_secs, 30);
+        assert_eq!(cfg.server.health.timeout_secs, 5);
+        assert_eq!(cfg.server.health.mode, HealthMode::Tcp);
+        assert!(cfg.resolve_upstreams().unwrap()["a"].uses_tls());
+    }
+
+    #[test]
+    fn rejects_bad_health_settings() {
+        for override_line in ["interval_secs = 0", "timeout_secs = 0", "mode = \"ping\""] {
+            let text = format!(
+                r#"
+[server]
+listen = "0.0.0.0:4000"
+[server.health]
+{override_line}
+[upstreams.a]
+base_url = "http://127.0.0.1:8000"
+"#
+            );
+            assert!(
+                Config::parse(&text).is_err(),
+                "{override_line} should be rejected"
+            );
+        }
     }
 }

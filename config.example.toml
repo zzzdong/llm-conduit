@@ -8,6 +8,14 @@ default_upstream = "llama-3.1-8b-instruct"
 # Request body limit; anything larger gets a 413. Default: 200000000 (200 MB)
 max_body_bytes = 200000000
 
+# Optional: upstream probing behind GET /readyz; these are the defaults.
+# `models` requires a successful GET /v1/models, `tcp` only opens a connection.
+[server.health]
+enabled = true
+interval_secs = 10
+timeout_secs = 2
+mode = "models"
+
 # Optional: configuring this section enables server-side HTTPS; leave it out for plain HTTP
 # [server.tls]
 # cert_path = "/etc/llm-conduit/fullchain.pem"

@@ -63,7 +63,7 @@ Every endpoint is **passed through**: the gateway only routes, authenticates and
 | `/v1/chat/completions` | POST | chat completion | body `model` or `X-Model` |
 | `/v1/completions` | POST | text completion | body `model` or `X-Model` |
 | `/v1/embeddings` | POST | embeddings | body `model` or `X-Model` |
-| `/v1/models` | GET | model list | optional, aggregated from upstreams |
+| `/v1/models` | GET | model list, aggregated by the gateway | answered locally, see 12.4 |
 | `/v1/models/{model}` | GET | model details | path parameter |
 | other `/v1/*` | any | pass through | body `model` or `X-Model` |
 
@@ -109,6 +109,13 @@ listen = "0.0.0.0:4000"
 default_upstream = "llama-3.1-8b-instruct"   # optional, fallback upstream when no model is given
 max_body_bytes = 200000000                   # optional, default 200MB, larger bodies get a 413
 
+# Optional: upstream probing behind GET /readyz; these are the defaults
+[server.health]
+enabled = true
+interval_secs = 10
+timeout_secs = 2
+mode = "models"                              # "models" probes GET /v1/models, "tcp" only connects
+
 # Optional: server-side TLS. Without it the gateway only speaks HTTP
 [server.tls]
 cert_path = "/etc/llm-conduit/cert.pem"
@@ -141,6 +148,10 @@ insecure_skip_verify = false
 | `server.default_upstream` | no | none | Fallback upstream when no model is specified |
 | `server.max_body_bytes` | no | 200MB | Request body limit; larger requests get a 413 |
 | `server.tls` | no | none | Present enables server-side HTTPS |
+| `server.health.enabled` | no | true | Probe upstreams in the background for `/readyz` |
+| `server.health.interval_secs` | no | 10 | Seconds between two probe passes |
+| `server.health.timeout_secs` | no | 2 | Timeout of a single probe |
+| `server.health.mode` | no | `models` | `models` needs a successful `GET /v1/models`, `tcp` only opens a connection |
 | `auth.enabled` | no | false | Enable caller authentication |
 | `auth.keys` | no | empty | Mapping from unified key to description |
 | `upstreams.<name>.base_url` | yes | — | Upstream root address, may include a path prefix |
@@ -281,7 +292,7 @@ rustls-pemfile = "2"
   ```json
   {"error":{"message":"...","type":"gateway_error"}}
   ```
-- Logs go to stderr and include a timestamp, the caller description, the model, the upstream, the status code and the elapsed time.
+- Logs go to stderr, one line per request, with the fields listed in 12.5 (request ID, caller, model, upstream, status, latency, byte counts, streaming flag).
 - The log level is controlled by the `RUST_LOG` environment variable.
 
 **Main error codes**
@@ -295,7 +306,95 @@ rustls-pemfile = "2"
 | Upstream error | 502 |
 | Internal error | 500 |
 
-## 12. Deployment and Builds
+## 12. Health, Readiness and Observability
+
+### 12.1 Endpoints answered by the gateway
+
+| Endpoint | Status | Behaviour |
+| :--- | :--- | :--- |
+| `GET /healthz` | always `200` | The process is alive and serving; never depends on an upstream. |
+| `GET /readyz` | `200` / `503` | `200` only when every upstream passed its last probe, `503` otherwise. |
+| `GET /v1/models` | `200` | Aggregated from the configuration (see 12.4). |
+
+Both health endpoints are answered *before* authentication, are never routed to an upstream and
+are not written to the request log, because orchestrators poll them every few seconds. They
+are the only paths the gateway answers itself besides `/v1/models`.
+
+A `/readyz` body names every upstream, so an operator can see what is wrong:
+
+```json
+{"probing":"enabled","status":"degraded","upstreams":{"primary":{"checked_secs_ago":2,"error":"GET /v1/models returned 503","status":"down"},"secondary":{"latency_ms":3,"checked_secs_ago":2,"status":"up"}}}
+```
+
+An upstream that has not been probed yet counts as ready, so turning probing on does not make
+the gateway unready during the first interval.
+
+### 12.2 Upstream probing
+
+A background task probes every upstream concurrently, controlled by `server.health` (section 5):
+
+- `mode = "models"` (default) requires a successful `GET /v1/models`. This is the functional
+  check, and it also catches wrong credentials, because a `401` counts as unhealthy.
+- `mode = "tcp"` only opens a connection. Use it for upstreams that do not serve `/v1/models`.
+
+Probe results only drive `/readyz`. Routing is deliberately unaffected: a configured upstream
+keeps receiving requests while it is marked unhealthy, and the caller sees the upstream's own
+error rather than a gateway invented one.
+
+State *changes* are logged (`upstream is healthy` / `upstream is unhealthy`); the steady state
+is logged at debug level so a long outage does not add one line per interval.
+
+### 12.3 Request IDs
+
+Every request carries an `X-Request-ID`:
+
+- a caller supplied value is reused, unless it is empty, non ASCII, longer than 128 characters
+  or contains control characters;
+- otherwise a random UUID v4 is generated;
+- it is forwarded to the upstream, so gateway and upstream logs can be correlated;
+- it is echoed back in the response headers, including for error responses.
+
+### 12.4 `/v1/models`
+
+The gateway answers `GET /v1/models` itself, with one entry per configured upstream, so an SDK
+calling `client.models.list()` only ever sees names the gateway can actually route:
+
+```json
+{"object":"list","data":[{"id":"llama-3.1-8b-instruct","object":"model","created":1757940000,"owned_by":"llm-conduit"}]}
+```
+
+The body is built once at startup, so it costs nothing per request. Like every other `/v1`
+endpoint it requires the caller's unified key. `GET /v1/models/{model}` is not intercepted and
+is still passed through (section 4.1).
+
+### 12.5 Structured logs
+
+One line per request is written to stderr when the response body is done — finished or aborted —
+so the byte counts and the latency are the real ones. A long streaming request therefore logs
+when the stream ends, not when it starts.
+
+```
+INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false method=POST path=/v1/chat/completions error=-
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `request_id` | Request ID, see 12.3 |
+| `caller` | Description of the unified key; `-` when auth is disabled |
+| `model` | Routing name the request resolved to; `-` for `/v1/models` and for failures before routing |
+| `upstream` | Upstream that served the request |
+| `status` | HTTP status returned to the client |
+| `elapsed_ms` | From receiving the request to finishing the response body |
+| `request_bytes` | Size of the request body |
+| `response_bytes` | Bytes forwarded to the client |
+| `stream` | `true` for server-sent event responses |
+| `aborted` | `true` when the client disconnected before the stream ended |
+| `method`, `path` | Request line |
+| `error` | Gateway error message; `-` on success |
+
+`4xx`/`5xx` responses and aborted streams log at `WARN`, everything else at `INFO`.
+
+## 13. Deployment and Builds
 
 **Command line**
 
@@ -350,7 +449,7 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target
 ```
 
-## 13. Usage Examples
+## 14. Usage Examples
 
 **Option 1: `X-Model` header (recommended)**
 ```bash
@@ -393,17 +492,17 @@ resp = client.chat.completions.create(
 )
 ```
 
-## 14. Future Extensions
+## 15. Future Extensions
 
-- Health checks and active failover.
+- Active failover: skip upstreams that are marked unhealthy when routing.
 - Simple circuit breaking: temporarily skip an upstream after N consecutive failures.
 - Per-key rate limiting, quotas and billing.
 - Request logging to disk or OpenTelemetry integration.
 - Multi-prefix routing.
 - Config file hot reload.
-- `/v1/models` aggregated across all upstreams.
+- `GET /v1/models/{model}` served locally, like the list endpoint.
 
-## 15. Appendix: Complete Config Example
+## 16. Appendix: Complete Config Example
 
 ```toml
 [server]

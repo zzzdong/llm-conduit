@@ -120,12 +120,13 @@ mod tests {
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Body, Frame};
     use hyper::header::CONTENT_TYPE;
-    use hyper::{Method, StatusCode, Version};
+    use hyper::{HeaderMap, Method, StatusCode, Version};
 
     use super::*;
     use crate::config::Config;
@@ -174,6 +175,7 @@ mod tests {
                         };
                         let authorization = header("authorization");
                         let x_model = header("x-model");
+                        let x_request_id = header("x-request-id");
                         let host = header("host");
                         let body = request.into_body().collect().await.unwrap().to_bytes();
 
@@ -181,6 +183,7 @@ mod tests {
                             "path": path,
                             "authorization": authorization,
                             "x_model": x_model,
+                            "x_request_id": x_request_id,
                             "host": host,
                             "body": String::from_utf8_lossy(&body),
                         });
@@ -211,6 +214,7 @@ mod tests {
     async fn spawn_gateway(config_text: &str) -> SocketAddr {
         let config = Config::parse(config_text).unwrap();
         let gateway = Arc::new(Gateway::new(config).unwrap());
+        gateway.spawn_health_prober();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -238,15 +242,17 @@ upstream_model = "served-name"
         )
     }
 
-    async fn send(
+    /// Send any request and return the status, the response headers and the body.
+    async fn send_full(
         addr: SocketAddr,
+        method: Method,
         path: &str,
         headers: &[(&str, &str)],
         body: &str,
-    ) -> (StatusCode, String, String) {
+    ) -> (StatusCode, HeaderMap, String) {
         let client = build_client(false).unwrap();
         let mut builder = Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(format!("http://{addr}{path}"))
             .version(Version::HTTP_11);
         for (name, value) in headers {
@@ -258,18 +264,29 @@ upstream_model = "served-name"
 
         let response = client.request(request).await.unwrap();
         let status = response.status();
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (
             status,
-            content_type,
+            headers,
             String::from_utf8_lossy(&bytes).into_owned(),
         )
+    }
+
+    async fn send(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, String, String) {
+        let (status, response_headers, body) =
+            send_full(addr, Method::POST, path, headers, body).await;
+        let content_type = response_headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (status, content_type, body)
     }
 
     fn echo_of(body: &str) -> serde_json::Value {
@@ -422,5 +439,133 @@ base_url = "http://{upstream}"
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Poll `/readyz` until it reports `expected`, so the assertions do not depend on
+    /// how quickly the first probe pass finishes.
+    async fn wait_for_readyz(addr: SocketAddr, expected: StatusCode) -> serde_json::Value {
+        for _ in 0..40 {
+            let (status, _, body) = send_full(addr, Method::GET, "/readyz", &[], "").await;
+            if status == expected {
+                return serde_json::from_str(&body).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("/readyz never returned {expected}");
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_are_not_proxied_and_report_upstream_state() {
+        let upstream = spawn_mock_upstream().await;
+        let gateway = spawn_gateway(&config_text(upstream, "")).await;
+
+        // /healthz is unauthenticated, always 200 and never touches an upstream.
+        let (status, headers, body) = send_full(gateway, Method::GET, "/healthz", &[], "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"],
+            "ok"
+        );
+
+        // The mock upstream answers the /v1/models probe, so everything is up.
+        let body = wait_for_readyz(gateway, StatusCode::OK).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["probing"], "enabled");
+        assert_eq!(body["upstreams"]["mock"]["status"], "up");
+        assert!(body["upstreams"]["mock"]["latency_ms"].is_number());
+        assert_eq!(body["upstreams"].as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unavailable_when_an_upstream_is_unreachable() {
+        // Nothing listens on this port: the address comes from a dropped listener.
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let gateway = spawn_gateway(&config_text(closed, "")).await;
+
+        let body = wait_for_readyz(gateway, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["upstreams"]["mock"]["status"], "down");
+        assert!(
+            body["upstreams"]["mock"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("GET /v1/models"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_aggregates_the_configured_upstreams() {
+        let upstream = spawn_mock_upstream().await;
+        let gateway = spawn_gateway(&config_text(upstream, "")).await;
+
+        // It is a regular /v1 endpoint, so auth applies.
+        let (status, _, _) = send_full(gateway, Method::GET, "/v1/models", &[], "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, headers, body) = send_full(
+            gateway,
+            Method::GET,
+            "/v1/models",
+            &[("authorization", "Bearer sk-gateway-0001")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["id"], "mock");
+        assert_eq!(body["data"][0]["object"], "model");
+        assert_eq!(body["data"][0]["owned_by"], "llm-conduit");
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_reused_forwarded_and_echoed_back() {
+        let upstream = spawn_mock_upstream().await;
+        let gateway = spawn_gateway(&config_text(upstream, "default_upstream = \"mock\"")).await;
+
+        // A caller supplied ID is reused in the response and in the upstream request.
+        let (status, headers, body) = send_full(
+            gateway,
+            Method::POST,
+            "/v1/chat/completions",
+            &[
+                ("authorization", "Bearer sk-gateway-0001"),
+                ("x-request-id", "caller-supplied-id"),
+            ],
+            r#"{"model":"mock","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("x-request-id").unwrap(), "caller-supplied-id");
+        assert_eq!(echo_of(&body)["x_request_id"], "caller-supplied-id");
+
+        // Without one, the gateway generates it and forwards that same value.
+        let (status, headers, body) = send_full(
+            gateway,
+            Method::POST,
+            "/v1/chat/completions",
+            &[("authorization", "Bearer sk-gateway-0001")],
+            r#"{"model":"mock","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let generated = headers
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(generated.len(), 36, "generated IDs are UUID shaped");
+        assert_eq!(echo_of(&body)["x_request_id"], generated.as_str());
     }
 }

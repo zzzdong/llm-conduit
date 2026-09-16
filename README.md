@@ -21,6 +21,9 @@ Client ──HTTP/HTTPS──▶ llm-conduit ──HTTP/HTTPS──▶ Upstream 
 - **Streaming end to end** — memory is proportional to a single request body, not to the number of concurrent requests.
 - **Small and static** — ~3.5 MB static binaries for `x86_64` and `aarch64` Linux (musl), no runtime dependencies.
 - **Optional TLS** — server-side TLS termination, optional upstream HTTPS (including self-signed).
+- **Health and readiness** — `GET /healthz` and `GET /readyz` backed by background upstream probing.
+- **Aggregated models** — `GET /v1/models` lists every routable name, so `client.models.list()` works.
+- **Traceable** — `X-Request-ID` in, forwarded upstream and echoed back, plus one structured log line per request.
 
 The full design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -111,6 +114,10 @@ routing name equal to the upstream `served_model_name`.
 | `server.default_upstream` | no | none | Fallback upstream when no model is specified |
 | `server.max_body_bytes` | no | `200000000` | Request body limit; larger requests get a `413` |
 | `server.tls.cert_path` / `key_path` | no | none | PEM certificate chain and private key; enables server-side HTTPS |
+| `server.health.enabled` | no | `true` | Probe upstreams in the background for `/readyz` |
+| `server.health.interval_secs` | no | `10` | Seconds between two probe passes |
+| `server.health.timeout_secs` | no | `2` | Timeout of a single probe |
+| `server.health.mode` | no | `models` | `models` (`GET /v1/models` must succeed) or `tcp` (connect only) |
 | `auth.enabled` | no | `false` | Require a unified key |
 | `auth.keys` | no | empty | Table of `key = "caller description"` (the description is logged) |
 | `upstreams.<name>.base_url` | yes | — | Upstream root address, may include a path prefix |
@@ -157,6 +164,49 @@ Errors are returned in OpenAI's shape, so existing clients display them correctl
 | Internal error | `500` |
 
 Upstream responses are passed through untouched, including their status code and body.
+
+## Health and readiness
+
+| Endpoint | Response |
+| :--- | :--- |
+| `GET /healthz` | Always `200`: the process is alive. Never touches an upstream. |
+| `GET /readyz` | `200` when every upstream passed its last probe, `503` otherwise. |
+| `GET /v1/models` | Every configured upstream, in OpenAI's format, so `client.models.list()` works. |
+
+Neither health endpoint needs a key, and neither is written to the request log, because
+orchestrators poll them constantly. `/readyz` names the upstream that is in trouble:
+
+```json
+{"status":"degraded","probing":"enabled","upstreams":{"primary":{"status":"down","error":"GET /v1/models returned 503","checked_secs_ago":2}}}
+```
+
+Upstreams are probed in the background — by default every 10 s with a 2 s timeout:
+
+```toml
+[server.health]
+enabled = true
+interval_secs = 10
+timeout_secs = 2
+mode = "models"    # "models" needs a successful GET /v1/models; "tcp" only opens a connection
+```
+
+Probes only drive `/readyz`: routing is unaffected, so a request for an upstream that is marked
+down is still forwarded and returns that upstream's own error. `enabled = false` makes
+`/readyz` always ready.
+
+## Request IDs and logs
+
+Every request carries an `X-Request-ID`: a caller supplied value is reused, otherwise a UUID v4
+is generated. It is forwarded to the upstream and echoed back, so gateway and upstream logs line
+up. One line per request is written once the response body is done:
+
+```
+INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false method=POST path=/v1/chat/completions error=-
+```
+
+`request_bytes` and `response_bytes` are the sizes actually transferred, `stream` marks
+server-sent event responses and `aborted` marks a client that disconnected mid-stream.
+`4xx`/`5xx` responses and aborted requests are logged at `WARN`.
 
 ## Deployment
 

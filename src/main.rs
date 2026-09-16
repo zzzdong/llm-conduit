@@ -6,7 +6,9 @@ mod auth;
 mod config;
 mod error;
 mod gateway;
+mod health;
 mod json_model;
+mod observe;
 mod proxy;
 mod server;
 mod tls;
@@ -101,7 +103,20 @@ async fn run(config_path: &Path) -> Result<(), StartupError> {
     let upstream_names: Vec<String> = config.upstreams.keys().cloned().collect();
     let auth_enabled = config.auth.enabled;
     let default_upstream = config.server.default_upstream.clone();
+    let health = config.server.health.clone();
     let gateway = Arc::new(Gateway::new(config)?);
+
+    // Start probing before the listener comes up, so /readyz reports real results early.
+    if gateway.spawn_health_prober().is_some() {
+        info!(
+            interval_secs = health.interval_secs,
+            timeout_secs = health.timeout_secs,
+            mode = health.mode.as_str(),
+            "upstream health probing enabled"
+        );
+    } else {
+        info!("upstream health probing disabled; /readyz always reports ready");
+    }
 
     let listener = TcpListener::bind(listen)
         .await
