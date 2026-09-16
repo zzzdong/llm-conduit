@@ -65,6 +65,21 @@ fn generate_request_id() -> String {
     out
 }
 
+/// Token counters of one response, as reported by the upstream `usage` object.
+///
+/// Every field is optional: plain OpenAI replies carry the first three, while the reasoning
+/// and cache counters are extensions that providers add (or omit) independently.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// `completion_tokens_details.reasoning_tokens`, i.e. what the model spent thinking.
+    pub reasoning_tokens: Option<u64>,
+    /// `prompt_tokens_details.cached_tokens`.
+    pub cached_tokens: Option<u64>,
+}
+
 /// Everything one request contributes to its log line. The line is emitted once the
 /// response body is done, so the byte counts and the latency are the real ones.
 pub struct RequestLog {
@@ -80,6 +95,14 @@ pub struct RequestLog {
     /// `true` for server-sent event responses.
     pub streaming: bool,
     pub request_bytes: u64,
+    /// Thinking effort requested by the caller, see `usage::extract_effort`.
+    pub effort: Option<String>,
+    /// Token budget of the request (`max_tokens` and friends).
+    pub max_tokens: Option<u64>,
+    /// Number of completions requested (`n`).
+    pub requested_choices: Option<u64>,
+    /// Token counters reported by the upstream; filled in while the response is metered.
+    pub usage: Option<TokenUsage>,
     pub error: Option<String>,
 }
 
@@ -97,6 +120,10 @@ impl RequestLog {
             status: StatusCode::OK,
             streaming: false,
             request_bytes: 0,
+            effort: None,
+            max_tokens: None,
+            requested_choices: None,
+            usage: None,
             error: None,
         }
     }
@@ -115,6 +142,10 @@ impl RequestLog {
             status,
             streaming,
             request_bytes,
+            effort,
+            max_tokens,
+            requested_choices,
+            usage,
             error,
         } = self;
 
@@ -129,8 +160,20 @@ impl RequestLog {
         let model = model.as_deref().unwrap_or("-");
         let upstream = upstream.as_deref().unwrap_or("-");
         let error = error.as_deref().unwrap_or("-");
+        let effort = effort.as_deref().unwrap_or("-");
         let status = status.as_u16();
         let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        // Optional counters are logged as `-` rather than omitted, so the field set of a
+        // log line never depends on what the upstream happened to report.
+        let usage = usage.unwrap_or_default();
+        let prompt_tokens = optional(usage.prompt_tokens);
+        let completion_tokens = optional(usage.completion_tokens);
+        let total_tokens = optional(usage.total_tokens);
+        let reasoning_tokens = optional(usage.reasoning_tokens);
+        let cached_tokens = optional(usage.cached_tokens);
+        let max_tokens = optional(max_tokens);
+        let requested_choices = optional(requested_choices);
 
         // Strings are recorded with `%` so the log stays unquoted and greppable.
         if failed {
@@ -145,6 +188,14 @@ impl RequestLog {
                 response_bytes,
                 stream = streaming,
                 aborted,
+                effort = %effort,
+                max_tokens = %max_tokens,
+                requested_choices = %requested_choices,
+                prompt_tokens = %prompt_tokens,
+                completion_tokens = %completion_tokens,
+                total_tokens = %total_tokens,
+                reasoning_tokens = %reasoning_tokens,
+                cached_tokens = %cached_tokens,
                 method = %method,
                 path = %path,
                 error = %error,
@@ -162,6 +213,14 @@ impl RequestLog {
                 response_bytes,
                 stream = streaming,
                 aborted,
+                effort = %effort,
+                max_tokens = %max_tokens,
+                requested_choices = %requested_choices,
+                prompt_tokens = %prompt_tokens,
+                completion_tokens = %completion_tokens,
+                total_tokens = %total_tokens,
+                reasoning_tokens = %reasoning_tokens,
+                cached_tokens = %cached_tokens,
                 method = %method,
                 path = %path,
                 error = %error,
@@ -169,6 +228,16 @@ impl RequestLog {
             );
         }
     }
+}
+
+/// Render an absent counter as `-`, so every log line carries the same fields.
+///
+/// The result is logged with `%` for the same reason the string fields are: a `String` value
+/// would be recorded as a quoted string, and `max_tokens="-"` does not grep like the rest.
+fn optional(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Wraps a response body, counts the bytes handed to the client and reports the total
@@ -182,6 +251,17 @@ pub struct MeteredBody {
     expected: Option<u64>,
     bytes: u64,
     finished: bool,
+    /// Optional body observer, see [`BodyObserver`]. Only the usage scanner uses it.
+    observer: Option<Box<dyn BodyObserver>>,
+}
+
+/// Inspects response body frames on their way to the client.
+///
+/// Frames are passed through untouched, so a panicking observer would break the response;
+/// implementations must stay cheap and total.
+pub trait BodyObserver: Send + Sync {
+    /// Called once per data frame, before it is handed to the client.
+    fn observe(&mut self, frame: &[u8]);
 }
 
 impl MeteredBody {
@@ -193,7 +273,22 @@ impl MeteredBody {
             expected,
             bytes: 0,
             finished: false,
+            observer: None,
         }
+    }
+
+    /// Attach an observer that sees every data frame of the response body.
+    pub fn with_observer(mut self, observer: Box<dyn BodyObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Replace the drop callback. Only the ordering tests use this: the real one is passed to
+    /// [`MeteredBody::new`] because it owns the request log.
+    #[cfg(test)]
+    fn with_report(mut self, report: Box<dyn FnOnce(u64, bool) + Send + Sync>) -> Self {
+        self.report = Some(report);
+        self
     }
 
     /// The whole body was handed to the client: either the end of the stream was polled, or
@@ -231,6 +326,9 @@ impl Body for MeteredBody {
             Some(Ok(frame)) => {
                 if let Some(data) = frame.data_ref() {
                     this.bytes += data.len() as u64;
+                    if let Some(observer) = this.observer.as_mut() {
+                        observer.observe(data);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -443,6 +541,16 @@ mod tests {
         log.status = StatusCode::OK;
         log.streaming = true;
         log.request_bytes = 42;
+        log.effort = Some("high".to_string());
+        log.max_tokens = Some(1024);
+        log.requested_choices = Some(2);
+        log.usage = Some(TokenUsage {
+            prompt_tokens: Some(12),
+            completion_tokens: Some(34),
+            total_tokens: Some(46),
+            reasoning_tokens: Some(20),
+            cached_tokens: Some(4),
+        });
         log.finish(128, false);
 
         let line = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
@@ -457,6 +565,14 @@ mod tests {
             "response_bytes=128",
             "stream=true",
             "aborted=false",
+            "effort=high",
+            "max_tokens=1024",
+            "requested_choices=2",
+            "prompt_tokens=12",
+            "completion_tokens=34",
+            "total_tokens=46",
+            "reasoning_tokens=20",
+            "cached_tokens=4",
             "method=POST",
             "path=/v1/chat/completions",
             "request completed",
@@ -495,5 +611,73 @@ mod tests {
         assert!(line.contains(" WARN "), "failures log at WARN: {line}");
         assert!(line.contains("request failed"), "{line}");
         assert!(line.contains("error=unknown model 'ghost'"), "{line}");
+        // Token and effort fields stay in place, as `-` when nothing was reported.
+        for expected in [
+            "effort=-",
+            "max_tokens=-",
+            "requested_choices=-",
+            "prompt_tokens=-",
+            "completion_tokens=-",
+            "total_tokens=-",
+            "reasoning_tokens=-",
+            "cached_tokens=-",
+        ] {
+            assert!(line.contains(expected), "missing {expected} in: {line}");
+        }
+    }
+
+    /// Observer that appends every frame it sees, so a test can assert on what went past.
+    struct Seen(Arc<Mutex<Vec<u8>>>);
+
+    impl BodyObserver for Seen {
+        fn observe(&mut self, frame: &[u8]) {
+            self.0.lock().unwrap().extend_from_slice(frame);
+        }
+    }
+
+    #[test]
+    fn observers_see_every_frame_that_goes_out() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (body, report) = meter(frames(&[b"data: 1\n\n", b"data: 2\n\n"]));
+        let mut body = body.with_observer(Box::new(Seen(Arc::clone(&seen))));
+        while drive(&mut body, Waker::noop()).is_some() {}
+
+        assert_eq!(&*seen.lock().unwrap(), b"data: 1\n\ndata: 2\n\n");
+        drop(body);
+        // The observer is additive: the byte count handed to the client is unchanged.
+        assert_eq!(*report.lock().unwrap(), Some((18, false)));
+    }
+
+    #[test]
+    fn the_observer_is_still_alive_while_the_report_runs() {
+        // The log callback reads the usage out of the observer through a shared handle, which
+        // only works because `Drop for MeteredBody` runs its report before its own fields —
+        // including the observer — are dropped. This test pins that ordering down: the report
+        // asserts that the value the observer published is already there.
+        struct Probe(Arc<Mutex<Option<u8>>>);
+
+        impl BodyObserver for Probe {
+            fn observe(&mut self, _frame: &[u8]) {
+                // Published eagerly, the way `UsageObserver` does.
+                *self.0.lock().unwrap() = Some(7);
+            }
+        }
+
+        let published = Arc::new(Mutex::new(None));
+        let seen_by_report = Arc::clone(&published);
+        let (body, _) = meter(frames(&[b"{}"]));
+        let body = body
+            .with_observer(Box::new(Probe(Arc::clone(&published))))
+            .with_report(Box::new(move |_, _| {
+                // Runs inside `Drop for MeteredBody`, i.e. before the observer field is dropped.
+                assert_eq!(
+                    *seen_by_report.lock().unwrap(),
+                    Some(7),
+                    "the report must be able to read what the observer published"
+                );
+            }));
+        let mut body = body;
+        while drive(&mut body, Waker::noop()).is_some() {}
+        drop(body);
     }
 }

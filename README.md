@@ -201,12 +201,33 @@ is generated. It is forwarded to the upstream and echoed back, so gateway and up
 up. One line per request is written once the response body is done:
 
 ```
-INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false method=POST path=/v1/chat/completions error=-
+INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false effort=high max_tokens=1024 requested_choices=- prompt_tokens=412 completion_tokens=128 total_tokens=540 reasoning_tokens=64 cached_tokens=- method=POST path=/v1/chat/completions error=-
 ```
 
 `request_bytes` and `response_bytes` are the sizes actually transferred, `stream` marks
 server-sent event responses and `aborted` marks a client that disconnected mid-stream.
 `4xx`/`5xx` responses and aborted requests are logged at `WARN`.
+
+### Thinking strength and token usage
+
+`effort` is the thinking strength the caller asked for, read from the request body. The first
+field present wins, so all the usual spellings work:
+
+| Key | Note |
+| :--- | :--- |
+| `reasoning_effort` | OpenAI's own field |
+| `thinking` | e.g. `"off"` / `"low"` / `"high"`, or `{"type": "high"}` |
+| `reasoning` | `{"reasoning": {"effort": "…"}}` |
+| `thinking_effort` | Alias |
+
+The token counters come from the upstream's `usage` object and are read while the response is
+forwarded, so `prompt_tokens` / `completion_tokens` / `total_tokens`, plus the optional
+`reasoning_tokens` and `cached_tokens`, cost nothing extra. Streamed responses work too: the
+gateway scans every server-sent event, joins one that is split across two writes, and logs the
+most complete counters it saw — the ones from the final chunk.
+
+`max_tokens` is the budget the caller requested and `requested_choices` is `n`. Anything the
+upstream did not report is logged as `-`, so the fields of a line never shift.
 
 ## Deployment
 

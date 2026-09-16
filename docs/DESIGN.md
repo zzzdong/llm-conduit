@@ -292,7 +292,7 @@ rustls-pemfile = "2"
   ```json
   {"error":{"message":"...","type":"gateway_error"}}
   ```
-- Logs go to stderr, one line per request, with the fields listed in 12.5 (request ID, caller, model, upstream, status, latency, byte counts, streaming flag).
+- Logs go to stderr, one line per request, with the fields listed in 12.5 (request ID, caller, model, upstream, status, latency, byte counts, streaming flag, thinking strength and token counters).
 - The log level is controlled by the `RUST_LOG` environment variable.
 
 **Main error codes**
@@ -370,11 +370,11 @@ is still passed through (section 4.1).
 ### 12.5 Structured logs
 
 One line per request is written to stderr when the response body is done — finished or aborted —
-so the byte counts and the latency are the real ones. A long streaming request therefore logs
-when the stream ends, not when it starts.
+so the byte counts, the latency and the token counters are the real ones. A long streaming
+request therefore logs when the stream ends, not when it starts.
 
 ```
-INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false method=POST path=/v1/chat/completions error=-
+INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3.1-8b-instruct upstream=primary status=200 elapsed_ms=1832 request_bytes=412 response_bytes=20481 stream=true aborted=false effort=high max_tokens=1024 requested_choices=- prompt_tokens=412 completion_tokens=128 total_tokens=540 reasoning_tokens=64 cached_tokens=- method=POST path=/v1/chat/completions error=-
 ```
 
 | Field | Meaning |
@@ -389,10 +389,50 @@ INFO request completed request_id=5f8c1b2a-…-… caller=frontend model=llama-3
 | `response_bytes` | Bytes forwarded to the client |
 | `stream` | `true` for server-sent event responses |
 | `aborted` | `true` when the client disconnected before the stream ended |
+| `effort` | Thinking strength, see 12.6 |
+| `max_tokens` | Token budget the caller asked for (`max_tokens` / `max_completion_tokens` / `max_output_tokens`) |
+| `requested_choices` | Value of `n`, the number of completions requested |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | `usage` as reported by the upstream |
+| `reasoning_tokens` | `usage.completion_tokens_details.reasoning_tokens`, i.e. tokens spent thinking |
+| `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` |
 | `method`, `path` | Request line |
 | `error` | Gateway error message; `-` on success |
 
-`4xx`/`5xx` responses and aborted streams log at `WARN`, everything else at `INFO`.
+Counters an upstream does not report are logged as `-`, never omitted, so the field set of a
+line does not depend on the upstream. `4xx`/`5xx` responses and aborted streams log at `WARN`,
+everything else at `INFO`.
+
+### 12.6 Thinking strength and token usage
+
+The request and response bodies are parsed for two observability fields only, and neither
+affects routing or the bytes forwarded upstream.
+
+**Thinking strength (`effort`)** is read from the request body. Providers disagree on the
+field, so the first one present wins, in this order:
+
+| Key | Note |
+| :--- | :--- |
+| `reasoning_effort` | OpenAI's own field |
+| `thinking` | Used by several providers, e.g. `"off"` / `"low"` / `"high"` |
+| `reasoning` | `{"reasoning": {"effort": "…"}}` |
+| `thinking_effort` | Alias |
+
+A plain string and an object with `type` / `effort` are both understood. Values that are not a
+non-empty string are ignored, so the field stays `-` rather than guessing.
+
+**Token usage** is read from the response body while it is metered, so no second pass over the
+body is needed. Both the buffered form (one JSON object) and the streamed form (server-sent
+events) work:
+
+- every event payload of a frame is examined, not just the last one, because an upstream may
+  batch several events into one write;
+- a frame that ends in the middle of a `usage` object is joined with the bytes of the next one;
+- when several usages are seen — the intermediate chunks of a stream report partial or null
+  ones — the most complete value wins, and the final chunk's counters are the ones logged.
+
+Reading a body therefore costs no extra allocation beyond a small per-request buffer that is
+capped at 16 KiB; once the cap is exceeded the bytes are treated as "not a usage object" and
+dropped rather than buffered.
 
 ## 13. Deployment and Builds
 

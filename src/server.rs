@@ -119,6 +119,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -154,13 +155,19 @@ mod tests {
 
     /// Start a fake (OpenAI-compatible) upstream: echo the request back and reply with SSE chunks.
     async fn spawn_mock_upstream() -> SocketAddr {
+        spawn_mock_upstream_with(&[]).await
+    }
+
+    /// Same, but the given chunks are appended before `[DONE]`, so a test can let the upstream
+    /// report a `usage` object.
+    async fn spawn_mock_upstream_with(extra: &'static [&'static str]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    let service = service_fn(|request: Request<Incoming>| async move {
+                    let service = service_fn(move |request: Request<Incoming>| async move {
                         let path = request
                             .uri()
                             .path_and_query()
@@ -190,6 +197,9 @@ mod tests {
 
                         let mut chunks = VecDeque::new();
                         chunks.push_back(Bytes::from(format!("data: {echo}\n\n")));
+                        for chunk in extra {
+                            chunks.push_back(Bytes::from_static(chunk.as_bytes()));
+                        }
                         chunks.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
 
                         Ok::<_, Infallible>(
@@ -526,6 +536,135 @@ base_url = "http://{upstream}"
         assert_eq!(body["data"][0]["id"], "mock");
         assert_eq!(body["data"][0]["object"], "model");
         assert_eq!(body["data"][0]["owned_by"], "llm-conduit");
+    }
+
+    /// Run `body` with the process log redirected to a string, and return what was written.
+    ///
+    /// The request log is emitted from the connection task, which runs on another worker thread,
+    /// so a thread-local subscriber would not see it. The global subscriber is therefore
+    /// installed once and writes into `CAPTURE`, and this helper takes the lock for the whole
+    /// call so the tests that use it cannot interleave.
+    fn captured_log_lines<F, Fut>(body: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        static CAPTURE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+        struct Shared;
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                CAPTURE.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| Shared)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+
+        // A dedicated guard: the capture buffer itself is locked per write, so it cannot also
+        // serialize the tests. Held across the request so they do not interleave.
+        static SERIALIZE: Mutex<()> = Mutex::new(());
+        let _serialize = SERIALIZE.lock().unwrap_or_else(|error| error.into_inner());
+
+        CAPTURE.lock().unwrap().clear();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body());
+        String::from_utf8(CAPTURE.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Lines of the captured log that describe the proxied request, i.e. not the health prober.
+    fn request_log_line(lines: &str) -> &str {
+        lines
+            .lines()
+            .find(|line| line.contains("path=/v1/chat/completions"))
+            .unwrap_or_else(|| panic!("no request log line in: {lines}"))
+    }
+
+    #[test]
+    fn a_completed_request_logs_effort_and_token_usage() {
+        let lines = captured_log_lines(|| async {
+            let upstream = spawn_mock_upstream_with(&[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46,\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n\n",
+            ])
+            .await;
+            let gateway =
+                spawn_gateway(&config_text(upstream, "default_upstream = \"mock\"")).await;
+
+            let (status, _, _) = send(
+                gateway,
+                "/v1/chat/completions",
+                &[("authorization", "Bearer sk-gateway-0001")],
+                r#"{"model":"mock","messages":[],"reasoning_effort":"high","max_tokens":512,"n":3}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        });
+
+        let line = request_log_line(&lines);
+        for expected in [
+            "effort=high",
+            "max_tokens=512",
+            "requested_choices=3",
+            "prompt_tokens=12",
+            "completion_tokens=34",
+            "total_tokens=46",
+            "reasoning_tokens=20",
+            // Counters the upstream did not report stay in the line as `-`.
+            "cached_tokens=-",
+        ] {
+            assert!(line.contains(expected), "missing {expected} in: {line}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_usage_split_over_two_writes_is_logged() {
+        let lines = captured_log_lines(|| async {
+            // The upstream flushes the second half of the usage object as its own chunk, which
+            // is what the scanner's carry-over buffer exists for.
+            let upstream = spawn_mock_upstream_with(&[
+                "data: {\"choices\":[],\"usage\":{\"prompt",
+                "_tokens\":7,\"completion_tokens\":9}}\n\n",
+            ])
+            .await;
+            let gateway =
+                spawn_gateway(&config_text(upstream, "default_upstream = \"mock\"")).await;
+
+            let (status, _, _) = send(
+                gateway,
+                "/v1/chat/completions",
+                &[("authorization", "Bearer sk-gateway-0001")],
+                r#"{"model":"mock","messages":[]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        });
+
+        let line = request_log_line(&lines);
+        for expected in [
+            "prompt_tokens=7",
+            "completion_tokens=9",
+            "total_tokens=16",
+            // No effort was requested, so the field is present but empty.
+            "effort=-",
+        ] {
+            assert!(line.contains(expected), "missing {expected} in: {line}");
+        }
     }
 
     #[tokio::test]
