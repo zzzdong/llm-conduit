@@ -62,14 +62,24 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     needs: [version, test]
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # One native runner per architecture. Ubuntu's archives have no musl cross compiler
+        # (musl-tools ships musl-gcc for the machine's own architecture only), so every
+        # target is built on a machine of that architecture: the toolchain install stays a
+        # plain apt call, the C dependency (AWS-LC) is compiled by a real musl gcc rather
+        # than a glibc cross compiler, and the binary can be smoke tested on the very
+        # runner that produced it.
         # Add more targets here (e.g. x86_64-pc-windows-msvc on windows-latest).
-        target:
-          - aarch64-unknown-linux-musl
-          - x86_64-unknown-linux-musl
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          # GitHub's hosted ARM runner (public repos, or Team/Enterprise for private ones);
+          # a self-hosted ARM runner label works just as well.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -83,14 +93,26 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # cross provides the musl toolchains for both targets inside a container.
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+      # musl-gcc compiles the C dependency (AWS-LC, through CMake). Only CC is set on purpose:
+      # rustc's own linker driver already emits a correct static musl binary, whereas pointing
+      # CARGO_TARGET_<TARGET>_LINKER at a distribution musl-gcc produces a *dynamic* binary
+      # against /lib/ld-musl-*.so.1 (that one segfaults on the x86_64 target). The static check
+      # further down rejects both, but only the former actually runs.
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # aws-lc-sys drives CMake, which the runners ship; install it if a slim image lacks it.
+          command -v cmake >/dev/null ||
+            sudo apt-get install -y --no-install-recommends cmake
+          musl-gcc --version | head -1
+          cmake --version | head -1
+
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cross build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Check the produced binary
         run: |
@@ -124,9 +146,13 @@ jobs:
 
           echo "$BIN is static with no dynamic dependencies"
 
-      - name: Smoke test (native arch only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: ./target/${{ matrix.target }}/release/llm-conduit --version
+      # Both artifacts are built natively, so each one runs on the runner that produced it.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/llm-conduit"
+          "$BIN" --version
+          "$BIN" --help >/dev/null
 
       - name: Package tarball
         run: |

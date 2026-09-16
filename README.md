@@ -19,7 +19,7 @@ Client ──HTTP/HTTPS──▶ llm-conduit ──HTTP/HTTPS──▶ Upstream 
 - **Model-based routing** — `X-Model` header, the top-level `model` field of the body, or a configured default.
 - **Key mapping** — callers never hold upstream credentials, so rotation stays invisible to them.
 - **Streaming end to end** — memory is proportional to a single request body, not to the number of concurrent requests.
-- **Small and static** — ~3.5 MB static binaries for `x86_64` and `aarch64` Linux (musl), no runtime dependencies.
+- **Small and static** — ~6 MB static binaries for `x86_64` and `aarch64` Linux (musl), no runtime dependencies.
 - **Optional TLS** — server-side TLS termination, optional upstream HTTPS (including self-signed).
 - **Health and readiness** — `GET /healthz` and `GET /readyz` backed by background upstream probing.
 - **Aggregated models** — `GET /v1/models` lists every routable name, so `client.models.list()` works.
@@ -33,8 +33,8 @@ The full design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md).
 [Releases](https://github.com/zzzdong/llm-conduit/releases/latest), or build it:
 
 ```bash
-cargo build --release            # native
-cross build --release --target aarch64-unknown-linux-musl    # static cross build
+cargo build --release                                        # native (glibc)
+cargo build --release --target x86_64-unknown-linux-musl     # static musl, see Development below
 ```
 
 The tarballs contain the binary plus `config.example.toml`:
@@ -256,15 +256,23 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All three run in CI on every push and pull request. Cross-compiling needs either
-[`cross`](https://github.com/cross-rs/cross) (as used by the release workflow) or a musl
-toolchain for the target (`musl-gcc`, `aarch64-linux-musl-gcc`):
+All three run in CI on every push and pull request.
+
+Static musl builds are done per architecture, on a machine of that architecture: Ubuntu's
+archives have no musl cross compiler, so `musl-tools` (plus `cmake`, which AWS-LC needs) is
+all it takes:
 
 ```bash
-CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
-CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc \
-  cargo build --release --target aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl     # aarch64-unknown-linux-musl on ARM
+sudo apt install musl-tools cmake
+CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
 ```
+
+`CC` is what compiles the C dependency (AWS-LC, through CMake); the Rust linker is deliberately
+left alone. Overriding `CARGO_TARGET_<TARGET>_LINKER` with a distribution `musl-gcc` turns the
+link dynamic (`/lib/ld-musl-*.so.1`) instead of static, and that binary segfaults on the
+`x86_64` target. The release workflow builds `x86_64-unknown-linux-musl` on `ubuntu-24.04` and
+`aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`.
 
 ## License
 

@@ -23,12 +23,12 @@ use crate::error::StartupError;
 /// Upstream HTTP client: pooled connections, fixed-length `Bytes` body.
 pub type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
-/// Install the process-wide rustls crypto provider (ring).
+/// Install the process-wide rustls crypto provider (aws-lc-rs).
 ///
 /// Installing it explicitly avoids a panic from `ClientConfig::builder()` when several providers are compiled in.
 pub fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 }
 
@@ -136,7 +136,7 @@ impl NoVerifier {
     fn new() -> Self {
         let provider = rustls::crypto::CryptoProvider::get_default()
             .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
         Self { provider }
     }
 }
@@ -185,5 +185,31 @@ impl ServerCertVerifier for NoVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_provider_is_installed_and_clients_build() {
+        // Guards the crypto provider wiring: with no provider installed, building a
+        // ClientConfig panics and no TLS client can be constructed at all.
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+
+        assert!(build_client(false).is_ok(), "client using the system roots");
+        assert!(
+            build_client(true).is_ok(),
+            "client that skips certificate verification"
+        );
+        assert!(
+            !NoVerifier::new()
+                .provider
+                .signature_verification_algorithms
+                .supported_schemes()
+                .is_empty()
+        );
     }
 }

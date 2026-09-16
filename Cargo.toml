@@ -36,20 +36,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.6"
 
-# Random request IDs (already in the dependency tree via rustls/ring)
+# Random request IDs (tiny, no build requirements of its own)
 getrandom = "0.2"
 
 # Command line parsing (--help / --version / usage errors)
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 
-# TLS: the ring provider, which avoids aws-lc-rs' C toolchain dependency and keeps
-# musl cross-compilation simple
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# TLS: aws-lc-rs, the provider rustls uses by default and that is actively maintained
+# (ring is largely in maintenance mode). It compiles AWS-LC from source, so a C compiler and
+# CMake are required; for musl builds that C code has to be compiled by a musl gcc too, which
+# is why the release workflow builds each target on a native runner of that architecture.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 rustls-pemfile = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = [
     "http1",
-    "ring",
+    "aws-lc-rs",
     "tls12",
     "logging",
     "native-tokio",

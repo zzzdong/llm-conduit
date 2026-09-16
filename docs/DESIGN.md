@@ -413,18 +413,28 @@ Options:
 Exit codes: help and version go to stdout and exit with 0; usage errors go to stderr and exit with 2;
 startup failures (unparsable config, unusable certificate, port already in use, ...) go to stderr and exit with 1.
 
-**Native build (on the ARM machine)**
+**Native build**
 ```bash
 cargo build --release
 ./target/release/llm-conduit config.toml
 ```
 
-**Cross-compiled static binary (x86 → ARM64)**
+**Static musl binary (per architecture)**
+Ubuntu's archives carry no musl cross compiler (`musl-tools` only ships `musl-gcc` for the
+machine's own architecture), so each target is built on a machine of that architecture — the
+release workflow uses `x86_64-unknown-linux-musl` on `ubuntu-24.04` and
+`aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`:
+
 ```bash
-rustup target add aarch64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl     # aarch64-unknown-linux-musl on ARM
+sudo apt install musl-tools cmake
+CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
 ```
-Artifact: `target/aarch64-unknown-linux-musl/release/llm-conduit`, roughly 3–5 MB, no glibc dependency.
+`CC` is what compiles the C dependency (AWS-LC, through CMake); the Rust linker is deliberately
+left alone. Overriding `CARGO_TARGET_<TARGET>_LINKER` with a distribution `musl-gcc` turns the
+link dynamic (`/lib/ld-musl-*.so.1`) instead of static, and that binary segfaults on `x86_64`.
+Artifact: `target/<target>/release/llm-conduit`, roughly 6 MB, statically linked with no glibc
+dependency (CI verifies this with `readelf`: no `PT_INTERP` and no `DT_NEEDED`).
 
 **Docker (optional)**
 ```dockerfile
